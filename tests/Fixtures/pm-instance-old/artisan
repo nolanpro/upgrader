@@ -1,0 +1,8 @@
+#!/usr/bin/env php
+<?php
+
+switch ($argv[1]) {
+    case 'down':
+        echo "Application is now in maintenance mode.";
+        break;
+}
