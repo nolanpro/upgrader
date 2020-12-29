@@ -6,4 +6,7 @@
         <exclude>./tests/Fixtures</exclude>
       </testsuite>
   </testsuites>
+  <php>
+    <ini name="memory_limit" value="1G" />
+  </php>
 </phpunit>

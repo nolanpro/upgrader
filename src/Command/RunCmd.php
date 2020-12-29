@@ -14,7 +14,7 @@ class RunCmd {
         }
         $exitCode = pclose($handle);
         if ($exitCode) {
-            throw new ExitCodeException("cmd failed with exit code $exitCode. Output is\n$allOutput");
+            throw new CmdFailedException("cmd failed with exit code $exitCode. Output is\n$allOutput");
         }
         return $allOutput;
     }

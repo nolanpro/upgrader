@@ -1,3 +1,5 @@
 /vendor
 /tests/Fixtures/pm-instance-4.0.16
-
+/tests/Fixtures/processmaker-4.0.16.zip
+/tests/Fixtures/PM4v4.0.16.tar.gz
+/tests/Fixtures/pm-instance-backup-*

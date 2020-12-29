@@ -15,10 +15,20 @@ class Upgrade extends Command {
         'docker-executor-php:install',
         'docker-executor-lua:install',
         'docker-executor-node:install',
+        'passport:install',
+    ];
+
+    const VERSIONS_FOR_4_0_16 = [
+        'connector-send-email' => '1.2.4',
+        'package-savedsearch' => '1.9.5',
+        'package-collections' => '1.6.4',
+        'package-webentry' => '1.2.5',
+        'package-dynamic-ui' => '1.0.1',
+        'package-files' => '1.1.5',
     ];
 
     protected static $defaultName = 'run';
-    private $input, $output, $helper, $oldPath, $client, $runCmd;
+    private $input, $output, $helper, $oldPath, $client, $runCmd, $dotenv;
 
     public function __construct(Client $client, $runCmd)
     {
@@ -29,7 +39,8 @@ class Upgrade extends Command {
 
     protected function configure()
     {
-        $this->addArgument('folder', InputArgument::REQUIRED, 'Folder of pm4 instance to upgrade');
+        $this->addArgument('symlink', InputArgument::REQUIRED, 'Symlink to a folder of the existing pm4 instance to upgrade');
+        $this->addArgument('archive', InputArgument::REQUIRED, 'Location of the zip or tar.gz build file to upgrade the instance to');
     }
 
     protected function execute(InputInterface $input, OutputInterface $output)
@@ -39,53 +50,163 @@ class Upgrade extends Command {
         $this->output->setVerbosity(OutputInterface::VERBOSITY_VERBOSE);
         $this->question = $this->getHelper('question');
 
-        $dir = $this->input->getArgument('folder');
+        try {
+            $this->call();
+        } catch (ExitException $e) {
+            return Command::SUCCESS;
+        }
+    }
+
+    protected function call()
+    {
+        $dir = $this->input->getArgument('symlink');
         $path = getcwd() . '/' . $dir;
         if (!file_exists($path)) {
             $this->error("Folder not found: $path");
         }
-
         if (!is_link($path)) {
             $this->error("Folder not a symlink: $path");
         }
-
-        $latest = $this->getVersion(); 
-        if (!$this->confirm("Upgrade $dir to $latest?")) {
-            return Command::SUCCESS;
-        }
-
-        $this->version = $latest;
         $this->oldPath = $path;
-        $this->info("Upgrading $dir to $latest");
-
         $this->maintenanceMode();
-        // $this->backupMysql();
+        $this->backupMysql();
 
         $this->extractRepo();
         $this->copyEnv();
         $this->addPrivatePackagist();
         $this->composerInstall();
         $this->updateI18Next();
+        $this->copyStorage();
         
-        // $this->runMigrations();
-        // $this->copyAndSymlinkStorage();
-
         $this->installBasePackages();
         $this->installPrivatePackages();
+        
+        $this->runMigrations();
 
-        return Command::SUCCESS;
+        $this->installJavascriptAssets();
+        $this->clearCache();
+
+        $this->artisan('down'); // maintenance mode in new install
+        $this->chown();
+        $this->symlink();
+        $this->restartServices();
+        $this->artisan('up');
+
+        return $this->exit();
     }
+
+    private function chown()
+    {
+        // $this->cmd("chown -R nginx:nginx $this->newPath");
+    }
+
+    private function restartServices()
+    {
+        // $this->cmd('systemctl restart php-fpm');
+        $this->artisan('horizon:terminate');
+    }
+
+    private function symlink()
+    {
+        unlink($this->oldPath);
+        $this->info("Symlinking source $this->newPath to destination $this->oldPath");
+        symlink($this->newPath, $this->oldPath);
+    }
+
+    private function clearCache()
+    {
+        $this->artisan('optimize:clear');
+    }
+
+    private function installJavascriptAssets()
+    {
+        if (file_exists($this->newPath . '/public/mix-manifest.json')) {
+            $this->info("Javascript assets already installed. Not running npm.");
+            return;
+        }
+
+        $this->repoCmd('npm install');
+        $this->repoCmd('npm run dev'); // should this be yarn?
+    }
+
+    private function runMigrations()
+    {
+        $this->artisan('migrate --force');
+    }
+
+    private function copyStorage()
+    {
+        $old = $this->oldPath . '/storage/*';
+        $new = $this->newPath . '/storage/'; 
+        $this->cmd("rsync -a $old $new");
+        $this->artisan('storage:link');
+    }
+    
+    private function backupMysql()
+    {
+        $this->mysqlDump();
+        $this->mysqlDump('DATA_');
+    }
+
+    private function mysqlDump($envPrefix = '')
+    {
+        $username = $this->env($envPrefix . 'DB_USERNAME');
+        $password = $this->env($envPrefix . 'DB_PASSWORD');
+        $host = $this->env($envPrefix . 'DB_HOSTNAME');
+        $port = $this->env($envPrefix . 'DB_PORT');
+        $database = $this->env($envPrefix . 'DB_DATABASE');
+        $time = time();
+
+        $basename = basename($this->oldPath);
+        $output = realpath($this->oldPath . '/../');
+        $output = "${output}/${basename}-backup-${envPrefix}${database}-${time}.sql";
+        $cmd = "mysqldump -u $username -p'$password' -h $host -P $port $database > $output";
+        $this->cmd($cmd);
+    }
+
+    private function env($key)
+    {
+        if (!$this->dotenv) {
+            $this->dotenv = \Dotenv\Dotenv::createImmutable($this->oldPath);
+            $this->dotenv->load();
+        }
+        if ($key === 'DATA_DB_HOSTNAME') {
+            $key = 'DATA_DB_HOST';
+        }
+        return $_ENV[$key];
+    }
+
 
     private function installBasePackages()
     {
         foreach (self::BASE_PACKAGE_INSTALL as $cmd) {
             $this->artisan($cmd);
         }
+
+        if ($this->is4016()) {
+            $this->artisan('horizon:assets');
+        } else {
+            $this->artisan('horizon:install');
+        }
     }
 
     private function installPrivatePackages()
     {
-
+        $packages = [];
+        foreach ($this->privatePackages() as $package) {
+            $version = "";
+            if ($this->is4016() && isset(self::VERSIONS_FOR_4_0_16[$package])) {
+                $version = ':' . self::VERSIONS_FOR_4_0_16[$package];
+            }
+            $packages[] = "processmaker/${package}${version}";
+        }
+        
+        $packages = join(" ", $packages);
+        $this->repoCmd("composer require $packages");
+        
+        foreach ($this->privatePackages() as $package) {
+            $this->artisan("${package}:install");
+        }
     }
 
     private function artisan($cmd)
@@ -95,16 +216,25 @@ class Upgrade extends Command {
 
     private function composerInstall()
     {
-        $this->info("Running composer install");
-        $this->repoCmd('composer install --no-dev');
+        if (!file_exists($this->newPath . '/vendor')) {
+            $this->info("Running composer install");
+            $this->repoCmd('composer install');
+        } else {
+            $this->info("Vendor folder exists. Not running composer install.");
+        }
     }
 
     private function updateI18Next()
     {
         // Only 4.0.X
-        if (preg_match('/^v?4\.0\./', $this->version)) {
+        if ($this->is4016()) {
             $this->repoCmd('composer update processmaker/laravel-i18next');
         }
+    }
+
+    private function is4016()
+    {
+        return $this->version === '4.0.16';
     }
     
     private function copyEnv()
@@ -128,43 +258,125 @@ class Upgrade extends Command {
         file_put_contents($path, json_encode($composer));
     }
 
+    private function endsWith( $haystack, $needle ) {
+        $length = strlen( $needle );
+        if( !$length ) {
+            return true;
+        }
+        return substr( $haystack, -$length ) === $needle;
+    }
+
     private function extractRepo()
     {
-        $this->info("Getting and extracting the repo");
-        $version = $this->version;
-        $zipPath = sys_get_temp_dir() . "/pm4_${version}.zip";
-        if (!file_exists($zipPath)) {
-            $url = "https://github.com/ProcessMaker/processmaker/archive/${version}.zip";
-            $this->info("Saving $url to $zipPath");
-            $this->client->request('GET', $url, [
-                'sink' => $zipPath,
-                'progress' => function ($downloadTotalSize, $downloaded, $uploadTotalSize, $uploaded) {
-                }
-            ]);
-        } else {
-            $this->info("Zip already exists. Not downloading again.");
+        $zipPath = $this->input->getArgument('archive');
+
+        if (is_dir($zipPath)) {
+            $this->newPath = $zipPath;
+            $this->version = $this->getVersion($this->newPath);
+            return;
         }
 
-        $extractPath = sys_get_temp_dir() . "/pm4_${version}";
+        if (!file_exists($zipPath)) {
+            $this->error("Archive not found: $zipPath");
+        }
+
+        $extractPath = sys_get_temp_dir() . "/pm4_extracted";
         $this->cmd("rm -rf $extractPath");
+
+        if ($this->endsWith($zipPath, '.zip')) {
+            $this->unZip($zipPath, $extractPath);
+        } elseif ($this->endsWith($zipPath, '.tar.gz')) {
+            $this->unTar($zipPath, $extractPath);
+        } else {
+            $this->error("Unknown file extension $zipPath");
+        }
+
+        $this->version = $this->getVersion($extractPath);
+        if (!$this->confirm("Upgrade $this->oldPath to $this->version?")) {
+            return $this->exit();
+        }
+
+        $newDir = basename($this->oldPath) . '-' . $this->version;
+        $this->newPath = realpath($this->oldPath . '/../') . '/' . $newDir;
+        
+        if (file_exists($this->newPath) && !$this->confirm($this->newPath . " already exists. It will be deleted. Continue?")) {
+            return $this->exit(); 
+        }
+        $this->cmd("rm -rf $this->newPath");
+        $this->cmd("cp -r $extractPath $this->newPath");
+    }
+
+    private function unZip($zipPath, $extractPath)
+    {
+        $tempDir = sys_get_temp_dir() . '/pm4_unzipped';
+        if (file_exists($tempDir)) {
+            $this->cmd("rm -rf $tempDir");
+        }
+
         $zip = new \ZipArchive;
-        $this->info("Unzipping $zipPath to $extractPath");
+        $this->info("Unzipping $zipPath to $tempDir");
         $res = $zip->open($zipPath);
         if ($res === true) {
-            $zip->extractTo($extractPath);
+            $zip->extractTo($tempDir);
             $zip->close();
         } else {
-            $this->error("Error unzipping $extractPath");
+            $this->error("Error unzipping $zipPath to $tempDir");
+        }
+
+        $this->moveToExtractPath($tempDir, $extractPath);
+    }
+
+    private function moveToExtractPath($tempDir, $extractPath)
+    {
+        $folders = array_filter(scandir($tempDir, 1), function($folder) {
+            return substr($folder, 0, 1) !== '.';
+        });
+        if (count($folders) === 1) {
+            // It's in a subfolder. Github archives do this
+            $dirToMove = $tempDir . '/' . $folders[0];
+        } else {
+            $dirToMove = $tempDir;
+        }
+
+        $this->info("Moving $dirToMove to $extractPath");
+        $this->cmd("mv $dirToMove $extractPath");
+
+        if (file_exists($tempDir)) {
+            $this->cmd("rm -rf $tempDir");
+        }
+    }
+
+    private function unTar($tarPath, $extractPath)
+    {
+        $tempPath = sys_get_temp_dir() . '/pm4.tar.gz';
+        $tempDir = sys_get_temp_dir() . '/pm4_untared';
+
+        if (file_exists($tempPath)) {
+            unlink($tempPath);
         }
         
-        $newDir = basename($this->oldPath) . '-' . $version;
-        $this->newPath = realpath($this->oldPath . '/../') . '/' . $newDir;
-        if (file_exists($this->newPath) && !$this->confirm($this->newPath . " already exists. It will be deleted. Continue?")) {
-            return Command::SUCCESS; 
+        if (file_exists($tempDir)) {
+            $this->cmd("rm -rf $tempDir");
         }
-        $dirInExtractPath = $extractPath . '/processmaker-' . $version;
-        $this->info("Copying $dirInExtractPath to $this->newPath");
-        $this->cmd("rm -rf $this->newPath && cp -r $dirInExtractPath $this->newPath");
+
+        copy($tarPath, $tempPath);
+        $tar = new \PharData($tempPath);
+        
+        $tempPath = substr($tempPath, 0, -3);
+        if (file_exists($tempPath)) {
+            unlink($tempPath);
+        }
+
+        $tar->decompress();
+        
+        $tar = new \PharData($tempPath);
+        $tar->extractTo($tempDir);
+
+        if (file_exists($tempPath)) {
+            unlink($tempPath);
+        }
+        
+        $this->moveToExtractPath($tempDir, $extractPath);
     }
 
     private function maintenanceMode()
@@ -186,49 +398,40 @@ class Upgrade extends Command {
                 $output = str_replace("\n", "\n--> ", $output);
                 $this->info("--> " . $output);
             });
-        } catch(ExitCodeException $e) {
+        } catch(CmdFailedException $e) {
             $this->error($e->getMessage());
         }
         return $allOutput;
     }
 
-    private function packages()
+    private function privatePackages()
     {
         $packagesFile = __DIR__ . '/PACKAGES';
         $packages = [];
         if (file_exists($packagesFile)) {
-            $packages = file_get_contents($packagesFile);
+            $packages = array_map(function($package) {
+                return trim($package);
+            }, file($packagesFile));
+        } else {
+            $this->info("PACKAGES file not found. Not installing any enterprise packages.");
         }
-        $packages = array_map(function($item) {
-            $def = explode(':', $item);
-            return [
-                'name' => $def[0],
-                'version' => isset($def[1]) ? $def[1] : null,
-            ];
-        }, $packages);
-
         return $packages;
     }
-
-    // private function cmd($cmd)
-    // {
-    //     $lastLine = system($cmd, $returnValue);
-    // }
 
     private function error($message)
     {
         throw new \Exception($message);
     }
 
-    private function getVersion()
+    private function exit()
     {
-        $this->info("Getting latest version from github.");
-        return $this->getFromGithub('/repos/processmaker/ProcessMaker/releases/latest')->tag_name;
+        $this->info("Quitting");
+        throw new ExitException();
     }
 
-    private function getFromGithub($path)
+    private function getVersion($path)
     {
-        $res = $this->client->request('GET', 'https://api.github.com'. $path);
-        return json_decode($res->getBody());
+        $composer = json_decode(file_get_contents($path . '/composer.json'));
+        return $composer->version;
     }
 }
